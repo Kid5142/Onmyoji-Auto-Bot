@@ -98,7 +98,6 @@ class OnmyojiBot:
             'reward_screen': 1.5,
             'exit_button': 3.0,
             'refresh_button': 3.0,
-            'realm_raid_button': 2.0
         }
         self.template_mapping = {
             'realm_raid': [
@@ -107,8 +106,9 @@ class OnmyojiBot:
                 'victory_screen', 'reward_screen', 'exit_button', 'section', 'enemy_event', 'empty'
             ],
             'souls': [
-                'souls_button', 'start_button', 'auto_button',
-                'victory_screen', 'reward_screen'
+                'start_button',
+                'victory_screen', 'reward_screen',
+                'plus_sign'
             ],
             'exploration': [
                 'exploration_button', 'chapter_button', 'zone_button',
@@ -349,8 +349,13 @@ class OnmyojiBot:
                 lparam = win32api.MAKELONG(int(x), int(y))
             except Exception:
                 lparam = (int(y) << 16) | (int(x) & 0xFFFF)
+
             win32gui.PostMessage(hwnd, win32con.WM_MOUSEMOVE, 0, lparam)
+            time.sleep(0.02)  # Trễ một chút để game nhận diện chuột đã di chuyển tới
+
             win32gui.PostMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lparam)
+            time.sleep(0.05)  # THÊM DÒNG NÀY: Giữ chuột 50ms (rất quan trọng)
+
             win32gui.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, lparam)
             return True
         except Exception as e:
@@ -516,6 +521,8 @@ class OnmyojiBot:
         task = self.tasks[self.current_task]
         if self.current_task == 'realm_raid':
             return self.execute_realm_raid_logic()
+        elif self.current_task == 'souls':
+            return self.execute_souls_logic()
         if task.get('mode') == 'dynamic':
             return self.execute_dynamic_task_step(task)
         if task['current_step'] >= len(task['steps']):
@@ -688,7 +695,7 @@ class OnmyojiBot:
                 return False
 
             # --- 0. CHECK ĐIỀU KIỆN KẾT THÚC (Hết vé/Hết người đánh) ---
-            if self.find_template(screen, 'empty', threshold=0.95):
+            if self.find_template(screen, 'empty', threshold=0.9):
                 print("🎉 Hoàn thành nhiệm vụ! Đang dừng tool...")
                 if self.gui:
                     self.gui.update_status("HOÀN THÀNH NHIỆM VỤ!", color="orange")
@@ -753,7 +760,9 @@ class OnmyojiBot:
                 chosen = all_targets[0]
                 self._log_debug(f"Chọn đối thủ tại {chosen['x']},{chosen['y']}")
                 self.click(chosen['x'], chosen['y'])
-                time.sleep(1.0)
+                if self.gui: self.gui.write_log("Đã chọn kẻ địch.")
+                if self.wait_for_template('attack_button', timeout=3.0):
+                    time.sleep(0.2)
                 s_check = self.capture_screen()
                 attack_match = self.find_template(s_check, 'attack_button', threshold=0.75)
                 if attack_match:
@@ -777,6 +786,73 @@ class OnmyojiBot:
             return False
         except Exception as e:
             self._log_debug(f"execute_realm_raid_logic exception: {e}")
+            return False
+
+    def execute_souls_logic(self):
+        if not self.current_task:
+            return False
+
+        try:
+            screen = self.capture_screen()
+            if screen is None or getattr(screen, 'size', 0) == 0:
+                return False
+
+            # --- 0. CHECK ĐIỀU KIỆN KẾT THÚC (Hết Sushi / Thể lực) ---
+            # Chụp bảng báo hết Sushi (hoặc hình cái Sushi 0/100) lưu tên là 'no_sushi'
+            if self.find_template(screen, 'no_sushi', threshold=0.85):
+                self._log_debug("🛑 Hết Sushi (Thể lực)! Dừng auto.")
+                if self.gui: self.gui.update_status("HOÀN THÀNH (HẾT SUSHI)!", color="orange")
+                self.stop_scanning()
+                return False
+
+            # --- 1. STATE: NHẬN THƯỞNG (REWARD) ---
+            reward_match = self.find_template(screen, 'reward_screen', threshold=0.8)
+            if reward_match:
+                self._log_debug("🎁 Đang ở màn hình nhận quà. Bấm để thoát.")
+                self.click(reward_match['x'], reward_match['y'])
+                time.sleep(1.0)  # Đợi chuyển cảnh về sảnh
+                if self.gui: self.gui.increment_battle()
+                return True
+
+            # --- 2. STATE: TRONG TRẬN (BATTLE) ---
+            if self.find_template(screen, 'battle_screen', threshold=0.75):
+                self.game_state['screen'] = 'in_battle'
+                if self.gui: self.gui.update_status("Đang kịch chiến Ngự Hồn...", color="blue")
+                # Đợi cho đến khi màn hình Reward xuất hiện (tối đa 3-4 phút tùy team)
+                self.wait_for_template('reward_screen', timeout=240)
+                return True
+
+            # --- 3. STATE: ĐỒNG Ý LỜI MỜI (Dành cho acc Clone/Member) ---
+            # Chụp nút "Accept" màu xanh khi bị mời vào team
+            accept_match = self.find_template(screen, 'accept_invite', threshold=0.8)
+            if accept_match:
+                self._log_debug("🤝 Có lời mời tổ đội! Đang Accept.")
+                self.click(accept_match['x'], accept_match['y'])
+                time.sleep(1.0)
+                return True
+
+            # --- 4. STATE: SẢNH CHỜ (LOBBY - Dành cho Leader) ---
+            fight_match = self.find_template(screen, 'start_button', threshold=0.75)
+            if fight_match:
+                # Đếm số lượng dấu cộng (+)
+                plus_signs = self.find_all_templates(screen, 'plus_sign', threshold=0.8)
+
+                # Giả sử mặc định là đi team 3 người (0 dấu cộng thì mới chạy)
+                if len(plus_signs) == 0:
+                    self._log_debug("🔥 Đã đủ 3 người! Start game.")
+                    if self.gui: self.gui.update_status("Đủ người, Bắt đầu!", color="green")
+                    self.click(fight_match['x'], fight_match['y'])
+                    time.sleep(1.5)  # Đợi game load vào trận
+                else:
+                    # Chưa đủ người, chỉ báo trạng thái chứ không click
+                    self._log_debug(f"⏳ Đang đợi team... (Thiếu {len(plus_signs)} người)")
+                    if self.gui: self.gui.update_status(f"Đang đợi team... ({3 - len(plus_signs)}/3)")
+                return True
+
+            return False
+
+        except Exception as e:
+            self._log_debug(f"execute_souls_logic exception: {e}")
             return False
 
     def start_scanning(self):
